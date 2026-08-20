@@ -40,6 +40,12 @@ services:
       # The code default stays at 4 for CPU-starved hosts such as Render free.
       - EMBEDDING_THREADS=${EMBEDDING_THREADS:-8}
       - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-64}
+      # "local" runs ONNX in-process; "http" calls a hosted endpoint serving the
+      # same model, for hosts without the CPU to embed (Render free is 0.1 vCPU).
+      # Verified identical vector space, so switching needs no re-indexing.
+      - EMBEDDING_BACKEND=${EMBEDDING_BACKEND:-local}
+      - EMBED_API_TOKEN=${EMBED_API_TOKEN:-}
+      - EMBED_HTTP_BATCH=${EMBED_HTTP_BATCH:-128}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:3000", "http://127.0.0.1:3000"]}
     depends_on:
       postgres:

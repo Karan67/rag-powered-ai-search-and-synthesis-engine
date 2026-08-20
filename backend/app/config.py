@@ -6,6 +6,16 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://rag_user:rag_password@localhost:5432/rag_db"
     EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
     EMBEDDING_DIM: int = 384
+    # "local" runs the model in-process via ONNX; "http" calls a hosted endpoint
+    # serving the SAME model, which is what makes a CPU-starved host viable
+    # without re-embedding anything already indexed.
+    EMBEDDING_BACKEND: str = "local"
+    EMBED_API_TOKEN: str = ""
+    # Blank derives the HuggingFace inference URL from EMBEDDING_MODEL.
+    EMBED_API_URL: str = ""
+    EMBED_HTTP_BATCH: int = 128
+    EMBED_HTTP_TIMEOUT: float = 60.0
+    EMBED_HTTP_RETRIES: int = 4
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 100
     # A chunk shorter than this carries too little context to answer from, and

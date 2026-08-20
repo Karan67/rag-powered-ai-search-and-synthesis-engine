@@ -1,41 +1,23 @@
 import logging
-from typing import Optional
-from fastembed import TextEmbedding
+
 from app.config import settings
+from app.services.embedding_provider import get_provider
 
 logger = logging.getLogger("rag_engine.vector_store")
 
-_embedding_model: Optional[TextEmbedding] = None
 
+def get_embedding_model():
+    """
+    Warm the configured embedding backend.
 
-def get_embedding_model() -> TextEmbedding:
+    Called at startup so the first upload does not pay model-load time, and so a
+    misconfigured backend fails loudly on boot rather than mid-ingest.
     """
-    Lazy-initialize and cache the FastEmbed TextEmbedding model.
-    Thread-safe for single-process async workloads (FastAPI/uvicorn default).
-    """
-    global _embedding_model
-    if _embedding_model is None:
-        logger.info(
-            f"Loading FastEmbed model: '{settings.EMBEDDING_MODEL}' "
-            f"(expected dim={settings.EMBEDDING_DIM})"
-        )
-        try:
-            _embedding_model = TextEmbedding(
-                model_name=settings.EMBEDDING_MODEL,
-                threads=settings.EMBEDDING_THREADS,
-            )
-            logger.info(
-                f"FastEmbed model '{settings.EMBEDDING_MODEL}' loaded successfully."
-            )
-        except Exception as e:
-            logger.error(
-                f"CRITICAL: Failed to load FastEmbed model '{settings.EMBEDDING_MODEL}': {e}",
-                exc_info=True,
-            )
-            raise RuntimeError(
-                f"Could not initialize embedding model '{settings.EMBEDDING_MODEL}': {e}"
-            ) from e
-    return _embedding_model
+    provider = get_provider()
+    # Round-trip one short string: for the local backend this forces the ONNX
+    # graph to load, and for the HTTP backend it proves credentials work.
+    provider.embed(["warmup"])
+    return provider
 
 
 def _validate_embedding_dim(embedding: list[float]) -> None:
@@ -57,34 +39,21 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     """
     Generate EMBEDDING_DIM-dimensional embeddings for a batch of text chunks.
 
-    Args:
-        texts: List of non-empty text strings to embed.
-
-    Returns:
-        List of float lists, each of length settings.EMBEDDING_DIM (384 for BGE-small).
-
     Raises:
-        RuntimeError: If the embedding model fails to load.
-        ValueError: If text list is empty or embedding dimensions are wrong.
+        RuntimeError: If the embedding backend fails.
+        ValueError: If the embedding dimensions are wrong.
     """
     if not texts:
         logger.warning("embed_texts called with empty texts list — returning empty result.")
         return []
 
-    model = get_embedding_model()
     logger.debug(f"Embedding batch of {len(texts)} text chunks...")
-
-    try:
-        embeddings_generator = model.embed(texts)
-        embeddings = [embedding.tolist() for embedding in embeddings_generator]
-    except Exception as e:
-        logger.error(f"Batch embedding failed for {len(texts)} texts: {e}", exc_info=True)
-        raise RuntimeError(f"FastEmbed batch embedding error: {e}") from e
+    embeddings = get_provider().embed(texts)
 
     if not embeddings:
-        raise RuntimeError("FastEmbed returned no embeddings for the provided text batch.")
+        raise RuntimeError("Embedding backend returned no embeddings for the provided batch.")
 
-    # Validate dimension of first embedding as a representative check
+    # Representative check; a backend returning mixed dimensions is broken anyway.
     _validate_embedding_dim(embeddings[0])
 
     logger.debug(f"Successfully embedded {len(embeddings)} chunks (dim={len(embeddings[0])}).")
@@ -93,32 +62,19 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 def embed_query(query: str) -> list[float]:
     """
-    Generate a single EMBEDDING_DIM-dimensional embedding for a search query string.
-
-    Args:
-        query: The query string to embed.
-
-    Returns:
-        A float list of length settings.EMBEDDING_DIM.
+    Generate a single EMBEDDING_DIM-dimensional embedding for a search query.
 
     Raises:
-        RuntimeError: If the embedding model fails to load or embed.
+        RuntimeError: If the embedding backend fails.
         ValueError: If the query is empty or embedding dimensions are wrong.
     """
     if not query or not query.strip():
         raise ValueError("embed_query received an empty query string.")
 
-    model = get_embedding_model()
-    logger.debug(f"Embedding query: '{query[:80]}...' " if len(query) > 80 else f"Embedding query: '{query}'")
+    embeddings = get_provider().embed([query])
+    if not embeddings:
+        raise RuntimeError("Embedding backend returned no embedding for the query.")
 
-    try:
-        embeddings_generator = model.embed([query])
-        embedding = list(next(embeddings_generator))
-    except StopIteration:
-        raise RuntimeError("FastEmbed returned no embedding for the query — generator was empty.")
-    except Exception as e:
-        logger.error(f"Query embedding failed: {e}", exc_info=True)
-        raise RuntimeError(f"FastEmbed query embedding error: {e}") from e
-
+    embedding = embeddings[0]
     _validate_embedding_dim(embedding)
     return embedding
