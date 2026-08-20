@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     TOP_K: int = 5
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     MAX_UPLOAD_MB: int = 15
+    # Queued uploads hold their bytes in memory until the worker reaches them,
+    # so the depth is capped: at MAX_UPLOAD_MB each, an unbounded queue is an
+    # out-of-memory kill waiting for a burst. Full returns 503, not a crash.
+    INGEST_QUEUE_SIZE: int = 4
     EMBEDDING_THREADS: int = 4
     EMBED_BATCH_SIZE: int = 64
     # Reply budget for a normal, narrowly-retrieved question. Deliberately high:

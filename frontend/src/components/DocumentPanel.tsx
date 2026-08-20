@@ -2,7 +2,7 @@
 
 import React, { useRef, useState } from "react";
 import { AlertCircle, Check, FileText, Loader2, Trash2, Upload, X } from "lucide-react";
-import { DocumentMeta } from "@/lib/api";
+import { DocumentMeta, IngestJob } from "@/lib/api";
 import { cn, formatBytes } from "@/lib/utils";
 
 export interface UploadStatus {
@@ -15,16 +15,87 @@ interface DocumentPanelProps {
   selectedDocIds: string[];
   isUploading: boolean;
   uploadStatus: UploadStatus | null;
+  jobs: IngestJob[];
+  onDismissJob: (id: string) => void;
   onUpload: (file: File) => void;
   onDelete: (id: string) => void;
   onSelectDocIdsChange: (ids: string[]) => void;
 }
+
+const STAGE_LABEL: Record<string, string> = {
+  queued: "Waiting to start",
+  parsing: "Reading document",
+  embedding: "Indexing",
+  completed: "Indexed",
+  failed: "Failed",
+};
+
+const JobCard: React.FC<{ job: IngestJob; onDismiss: () => void }> = ({ job, onDismiss }) => {
+  const failed = job.status === "failed";
+  // Parsing reports no chunk counts, so show an indeterminate state rather than
+  // a bar frozen at zero, which reads as stuck.
+  const pct =
+    job.chunks_total > 0 ? Math.round((job.chunks_done / job.chunks_total) * 100) : null;
+
+  return (
+    <div
+      className={cn(
+        "rounded-lg px-2.5 py-2",
+        failed ? "bg-red-500/10" : "bg-gray-100 dark:bg-gray-850"
+      )}
+    >
+      <div className="flex items-start gap-2">
+        {failed ? (
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-500" />
+        ) : (
+          <Loader2 className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-gray-500" />
+        )}
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-medium text-gray-800 dark:text-gray-200">
+            {job.filename}
+          </p>
+          <p
+            className={cn(
+              "mt-0.5 text-[11px]",
+              failed ? "text-red-600 dark:text-red-400" : "text-gray-500"
+            )}
+          >
+            {failed
+              ? job.error || "Indexing failed"
+              : `${STAGE_LABEL[job.status] ?? job.status}${
+                  pct !== null ? ` · ${job.chunks_done}/${job.chunks_total} chunks` : ""
+                }`}
+          </p>
+        </div>
+        {failed && (
+          <button onClick={onDismiss} title="Dismiss" className="icon-btn p-1">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+
+      {!failed && (
+        <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-gray-800">
+          <div
+            className={cn(
+              "h-full rounded-full bg-gray-900 dark:bg-gray-100",
+              pct === null ? "w-1/3 animate-pulse" : "transition-all duration-500"
+            )}
+            style={pct !== null ? { width: `${pct}%` } : undefined}
+          />
+        </div>
+      )}
+    </div>
+  );
+};
 
 export const DocumentPanel: React.FC<DocumentPanelProps> = ({
   documents,
   selectedDocIds,
   isUploading,
   uploadStatus,
+  jobs,
+  onDismissJob,
   onUpload,
   onDelete,
   onSelectDocIdsChange,
@@ -78,8 +149,10 @@ export const DocumentPanel: React.FC<DocumentPanelProps> = ({
         {isUploading ? (
           <>
             <Loader2 className="mb-2 h-5 w-5 animate-spin text-gray-500" />
-            <p className="text-xs font-medium text-gray-700 dark:text-gray-300">Indexing</p>
-            <p className="mt-0.5 text-[11px] text-gray-500">Embedding and storing chunks</p>
+            {/* Only the transfer happens here now; indexing progress belongs to
+                the job card below, so claiming "Indexing" would be wrong. */}
+            <p className="text-xs font-medium text-gray-700 dark:text-gray-300">Uploading</p>
+            <p className="mt-0.5 text-[11px] text-gray-500">Queueing for indexing</p>
           </>
         ) : (
           <>
@@ -107,6 +180,14 @@ export const DocumentPanel: React.FC<DocumentPanelProps> = ({
             <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           )}
           <span>{uploadStatus.msg}</span>
+        </div>
+      )}
+
+      {jobs.length > 0 && (
+        <div className="mb-3 space-y-1.5">
+          {jobs.map((job) => (
+            <JobCard key={job.id} job={job} onDismiss={() => onDismissJob(job.id)} />
+          ))}
         </div>
       )}
 
