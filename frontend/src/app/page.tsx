@@ -1,12 +1,25 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
-import { FileUploader } from "@/components/FileUploader";
-import { ChatWindow } from "@/components/ChatWindow";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { ChatView } from "@/components/ChatView";
 import { CitationDrawer } from "@/components/CitationDrawer";
-import { ChatHistorySidebar } from "@/components/ChatHistorySidebar";
-import { DocumentMeta, Citation, Message, fetchDocuments } from "@/lib/api";
-import { ChatSession, createSession, loadSessions, saveSessions, deriveTitle } from "@/lib/chatHistory";
+import { UploadStatus } from "@/components/DocumentPanel";
+import { Sidebar, SidebarTab } from "@/components/Sidebar";
+import {
+  Citation,
+  DocumentMeta,
+  Message,
+  deleteDocument,
+  fetchDocuments,
+  uploadDocument,
+} from "@/lib/api";
+import {
+  ChatSession,
+  createSession,
+  deriveTitle,
+  loadSessions,
+  saveSessions,
+} from "@/lib/chatHistory";
 
 export default function Home() {
   const [documents, setDocuments] = useState<DocumentMeta[]>([]);
@@ -14,38 +27,47 @@ export default function Home() {
   const [activeCitation, setActiveCitation] = useState<Citation | null>(null);
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string>("");
+  const [activeSessionId, setActiveSessionId] = useState("");
   const [hydrated, setHydrated] = useState(false);
 
-  // Load saved chat sessions from localStorage on first mount (client-only).
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarTab, setSidebarTab] = useState<SidebarTab>("chats");
+
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<UploadStatus | null>(null);
+  const statusTimer = useRef<ReturnType<typeof setTimeout>>();
+
+  // Restore chats from localStorage on first mount (client only).
   useEffect(() => {
     const stored = loadSessions();
     const initial = stored.length > 0 ? stored : [createSession()];
     setSessions(initial);
     setActiveSessionId(initial[0].id);
+    setSidebarOpen(window.innerWidth >= 768);
     setHydrated(true);
   }, []);
 
-  // Persist sessions after hydration so we never overwrite storage with the
-  // empty initial state on first render.
+  // Persist only after hydration, so the empty initial state never overwrites
+  // real saved history.
   useEffect(() => {
     if (hydrated) saveSessions(sessions);
   }, [sessions, hydrated]);
 
-  const loadDocuments = async () => {
+  const loadDocuments = useCallback(async () => {
     try {
-      const docs = await fetchDocuments();
-      setDocuments(docs);
+      setDocuments(await fetchDocuments());
     } catch (err) {
       console.warn("Could not fetch documents (backend may still be starting):", err);
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadDocuments();
     const interval = setInterval(loadDocuments, 10000);
     return () => clearInterval(interval);
-  }, []);
+  }, [loadDocuments]);
+
+  useEffect(() => () => clearTimeout(statusTimer.current), []);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
 
@@ -54,10 +76,11 @@ export default function Home() {
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== activeSessionId) return s;
-          const nextMessages = updater(s.messages);
-          const firstUserMsg = nextMessages.find((m) => m.sender === "user");
-          const nextTitle = s.title === "New Chat" && firstUserMsg ? deriveTitle(firstUserMsg.text) : s.title;
-          return { ...s, messages: nextMessages, title: nextTitle, updatedAt: Date.now() };
+          const messages = updater(s.messages);
+          const firstUserMsg = messages.find((m) => m.sender === "user");
+          const title =
+            s.title === "New chat" && firstUserMsg ? deriveTitle(firstUserMsg.text) : s.title;
+          return { ...s, messages, title, updatedAt: Date.now() };
         })
       );
     },
@@ -65,15 +88,14 @@ export default function Home() {
   );
 
   const handleNewChat = () => {
+    // Reuse the current chat if it is already blank rather than stacking up
+    // identical empty entries in the sidebar.
+    const current = sessions.find((s) => s.id === activeSessionId);
+    if (current && current.messages.length === 0) return;
     const fresh = createSession();
     setSessions((prev) => [fresh, ...prev]);
     setActiveSessionId(fresh.id);
-  };
-
-  const handleRenameSession = (id: string, newTitle: string) => {
-    setSessions((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, title: newTitle } : s))
-    );
+    setSidebarTab("chats");
   };
 
   const handleDeleteSession = (id: string) => {
@@ -84,56 +106,103 @@ export default function Home() {
         setActiveSessionId(fresh.id);
         return [fresh];
       }
-      if (id === activeSessionId) {
-        setActiveSessionId(remaining[0].id);
-      }
+      if (id === activeSessionId) setActiveSessionId(remaining[0].id);
       return remaining;
     });
   };
 
+  const showStatus = (status: UploadStatus) => {
+    clearTimeout(statusTimer.current);
+    setUploadStatus(status);
+    statusTimer.current = setTimeout(() => setUploadStatus(null), 8000);
+  };
+
+  const handleUpload = async (file: File) => {
+    setIsUploading(true);
+    setUploadStatus(null);
+    // Surface the document list so indexing progress is visible.
+    setSidebarTab("files");
+    setSidebarOpen(true);
+
+    try {
+      const res = await uploadDocument(file);
+      showStatus({ type: "success", msg: res.message });
+      loadDocuments();
+    } catch (err) {
+      showStatus({
+        type: "error",
+        msg: err instanceof Error ? err.message : "Upload failed.",
+      });
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleDeleteDocument = async (id: string) => {
+    try {
+      await deleteDocument(id);
+      setSelectedDocIds((prev) => prev.filter((d) => d !== id));
+      loadDocuments();
+    } catch (err) {
+      showStatus({
+        type: "error",
+        msg: err instanceof Error ? err.message : "Could not delete document.",
+      });
+    }
+  };
+
   if (!hydrated || !activeSession) {
-    return (
-      <main className="flex h-screen w-screen items-center justify-center bg-background text-slate-500 text-sm">
-        Loading...
-      </main>
-    );
+    return <main className="h-screen w-screen bg-white dark:bg-gray-900" />;
   }
 
   return (
-    <main className="flex h-screen w-screen overflow-hidden bg-background">
-      {/* Document Ingestion & List Sidebar */}
-      <FileUploader
+    <main className="flex h-screen w-screen overflow-hidden bg-white dark:bg-gray-900">
+      <Sidebar
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+        tab={sidebarTab}
+        onTabChange={setSidebarTab}
+        sessions={sessions}
+        activeSessionId={activeSession.id}
+        onSelectSession={(id) => {
+          setActiveSessionId(id);
+          if (window.innerWidth < 768) setSidebarOpen(false);
+        }}
+        onNewChat={handleNewChat}
+        onDeleteSession={handleDeleteSession}
+        onRenameSession={(id, title) =>
+          setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title } : s)))
+        }
         documents={documents}
-        onDocumentsChange={loadDocuments}
         selectedDocIds={selectedDocIds}
+        isUploading={isUploading}
+        uploadStatus={uploadStatus}
+        onUpload={handleUpload}
+        onDeleteDocument={handleDeleteDocument}
         onSelectDocIdsChange={setSelectedDocIds}
       />
 
-      {/* Chat History Sidebar */}
-      <ChatHistorySidebar
-        sessions={sessions}
-        activeSessionId={activeSession.id}
-        onSelectSession={setActiveSessionId}
-        onNewChat={handleNewChat}
-        onDeleteSession={handleDeleteSession}
-        onRenameSession={handleRenameSession}
-      />
-
-      {/* Main RAG Interactive Chat Window */}
-      <ChatWindow
+      <ChatView
         key={activeSession.id}
+        title={activeSession.title}
         messages={activeSession.messages}
         onMessagesChange={updateActiveMessages}
+        onSelectCitation={setActiveCitation}
+        onNewChat={handleNewChat}
+        sidebarOpen={sidebarOpen}
+        onOpenSidebar={() => setSidebarOpen(true)}
+        onOpenFiles={() => {
+          setSidebarOpen(true);
+          setSidebarTab("files");
+        }}
+        documents={documents}
         selectedDocIds={selectedDocIds}
-        onSelectCitation={(citation) => setActiveCitation(citation)}
-        documentCount={documents.length}
+        onSelectDocIdsChange={setSelectedDocIds}
+        isUploading={isUploading}
+        onUpload={handleUpload}
       />
 
-      {/* Slide-over Context & Citation Drawer */}
-      <CitationDrawer
-        citation={activeCitation}
-        onClose={() => setActiveCitation(null)}
-      />
+      <CitationDrawer citation={activeCitation} onClose={() => setActiveCitation(null)} />
     </main>
   );
 }

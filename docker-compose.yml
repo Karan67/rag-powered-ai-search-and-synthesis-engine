@@ -34,6 +34,12 @@ services:
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-100}
       - SIMILARITY_THRESHOLD=${SIMILARITY_THRESHOLD:-0.3}
       - TOP_K=${TOP_K:-5}
+      # Measured on this 12-core host: 4 threads gives 3.1 chunks/s, 8 gives 7.9,
+      # and 12 gives no further gain while starving postgres and the API event
+      # loop. Batch sizes above 64 were slower under the container memory limit.
+      # The code default stays at 4 for CPU-starved hosts such as Render free.
+      - EMBEDDING_THREADS=${EMBEDDING_THREADS:-8}
+      - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-64}
       - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost:3000", "http://127.0.0.1:3000"]}
     depends_on:
       postgres:

@@ -1,73 +1,91 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
   body {
-    @apply bg-background text-slate-100 font-sans antialiased;
+    @apply bg-white text-gray-900 antialiased;
+    @apply dark:bg-gray-900 dark:text-gray-100;
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
   }
 
   ::selection {
-    @apply bg-primary-600 text-white;
+    @apply bg-gray-900/10 dark:bg-white/20;
+  }
+
+  /* Kill the default focus ring; components opt into a subtle ring instead. */
+  :focus-visible {
+    outline: none;
   }
 }
 
-/* Custom Scrollbar */
+@layer components {
+  /* Quiet ghost button used for every icon action in the chrome. */
+  .icon-btn {
+    @apply inline-flex items-center justify-center rounded-lg p-1.5 text-gray-500
+           transition-colors hover:bg-gray-100 hover:text-gray-900
+           dark:text-gray-400 dark:hover:bg-gray-850 dark:hover:text-gray-100;
+  }
+}
+
+/*
+ * Streaming caret. Anchored to the last rendered block rather than appended as
+ * a sibling, so it trails the final word instead of dropping onto its own line
+ * when the answer ends in a list.
+ */
+.streaming > p:last-child::after,
+.streaming > ul:last-child > li:last-child::after,
+.streaming > ol:last-child > li:last-child::after {
+  content: "";
+  display: inline-block;
+  width: 3px;
+  height: 1em;
+  margin-left: 3px;
+  border-radius: 2px;
+  vertical-align: text-bottom;
+  background-color: currentColor;
+  animation: caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  to {
+    visibility: hidden;
+  }
+}
+
+/* Thin, low-contrast scrollbars — visible enough to grab, quiet enough to ignore. */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #090d16;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #334155;
+  background-color: rgba(0, 0, 0, 0.15);
   border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #475569;
+  background-color: rgba(0, 0, 0, 0.3);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.3);
 }
 
-/* Glassmorphism Panel */
-.glass-panel {
-  background: rgba(15, 23, 42, 0.75);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
 }
 
-/* Subtle pulse animation */
-.pulse-subtle {
-  animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-}
-
-@keyframes pulse-subtle {
-  0%, 100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
-}
-
-/* CitationDrawer slide-in animation */
-.animate-fade-in {
-  animation: fade-in 0.2s ease-out;
-}
-
-.animate-slide-left {
-  animation: slide-left 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-@keyframes fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes slide-left {
-  from { transform: translateX(100%); }
-  to { transform: translateX(0); }
+textarea {
+  scrollbar-width: thin;
 }

@@ -53,53 +53,94 @@ def parse_document(file_bytes: bytes, filename: str, content_type: str) -> list[
     else: # Default text / md / unknown
         return extract_text_from_plain_text(file_bytes)
 
+def _flatten_pages(pages: list[dict[str, Any]]) -> tuple[str, list[tuple[int, int]]]:
+    """
+    Join pages into one continuous stream, recording the offset each page starts
+    at so a chunk can still report the page it came from.
+
+    Chunking pages in isolation is what produced runt chunks: a page whose length
+    is not a clean multiple of the stride emits a tiny leftover tail (e.g. 32
+    chars), and prose that runs across a page break gets cut mid-sentence. Those
+    fragments then dominate similarity search for short queries, because a
+    32-character chunk containing a name is almost entirely "about" that name.
+    """
+    parts: list[str] = []
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for page_info in pages:
+        text = page_info["text"]
+        if not text:
+            continue
+        offsets.append((cursor, page_info["page_number"]))
+        parts.append(text)
+        cursor += len(text) + 1  # +1 for the space joining pages
+    return " ".join(parts), offsets
+
+
+def _page_for_offset(offsets: list[tuple[int, int]], position: int) -> int:
+    """Page number containing a character offset in the flattened stream."""
+    page = offsets[0][1] if offsets else 1
+    for start, page_number in offsets:
+        if start > position:
+            break
+        page = page_number
+    return page
+
+
 def chunk_text_sliding_window(
     pages: list[dict[str, Any]],
     chunk_size: int = settings.CHUNK_SIZE,
-    chunk_overlap: int = settings.CHUNK_OVERLAP
+    chunk_overlap: int = settings.CHUNK_OVERLAP,
+    min_chunk_chars: int = settings.MIN_CHUNK_CHARS,
 ) -> list[dict[str, Any]]:
     """
     Creates overlapping text chunks with character position and page metadata.
     """
-    chunks = []
-    global_chunk_idx = 0
-    
-    for page_info in pages:
-        text = page_info["text"]
-        page_num = page_info["page_number"]
-        
-        if not text:
-            continue
-            
-        start = 0
-        text_len = len(text)
-        
-        while start < text_len:
-            end = min(start + chunk_size, text_len)
-            
-            # If not at the end of string, try to break at space or newline boundary
-            if end < text_len:
-                last_space = text.rfind(' ', start + int(chunk_size * 0.7), end)
-                if last_space != -1 and last_space > start:
-                    end = last_space
-                    
-            chunk_content = text[start:end].strip()
-            
-            if chunk_content:
+    text, offsets = _flatten_pages(pages)
+    text_len = len(text)
+    if text_len == 0:
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    start = 0
+
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+
+        # Prefer a word boundary so chunks do not end mid-word.
+        if end < text_len:
+            last_space = text.rfind(" ", start + int(chunk_size * 0.7), end)
+            if last_space != -1 and last_space > start:
+                end = last_space
+
+        content = text[start:end].strip()
+
+        if content:
+            # A trailing fragment too short to carry meaning is folded into the
+            # previous chunk rather than stored as its own searchable record.
+            if len(content) < min_chunk_chars and chunks:
+                previous = chunks[-1]
+                previous["content"] = f"{previous['content']} {content}".strip()
+                previous["metadata"]["end_char"] = end
+                previous["metadata"]["length"] = len(previous["content"])
+            else:
                 chunks.append({
-                    "chunk_index": global_chunk_idx,
-                    "content": chunk_content,
+                    "chunk_index": len(chunks),
+                    "content": content,
                     "metadata": {
-                        "page_number": page_num,
+                        "page_number": _page_for_offset(offsets, start),
                         "start_char": start,
                         "end_char": end,
-                        "length": len(chunk_content)
-                    }
+                        "length": len(content),
+                    },
                 })
-                global_chunk_idx += 1
-                
-            start += (chunk_size - chunk_overlap)
-            if start >= text_len:
-                break
-                
+
+        if end >= text_len:
+            break
+
+        # Step from where this chunk actually ended, not from a fixed stride —
+        # otherwise a chunk shortened to a word boundary leaves a gap of dropped
+        # text before the next one begins.
+        start = max(end - chunk_overlap, start + 1)
+
     return chunks

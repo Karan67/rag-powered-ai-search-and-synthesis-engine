@@ -81,12 +81,18 @@ rag-document-engine/
         │   ├── layout.tsx
         │   └── page.tsx
         ├── components/
-        │   ├── FileUploader.tsx
-        │   ├── ChatWindow.tsx
-        │   ├── MessageBubble.tsx
-        │   └── CitationDrawer.tsx
+        │   ├── Sidebar.tsx        — chats/files sidebar shell
+        │   ├── ChatList.tsx       — date-grouped chat history
+        │   ├── DocumentPanel.tsx  — upload + indexed document list
+        │   ├── ChatView.tsx       — header, message feed, landing state
+        │   ├── Composer.tsx       — prompt input, attach, doc-filter chips
+        │   ├── MessageBubble.tsx  — markdown + inline citation badges
+        │   ├── CitationDrawer.tsx — retrieved-passage slide-over
+        │   └── ThemeToggle.tsx    — light/dark switch
         └── lib/
-            └── api.ts
+            ├── api.ts
+            ├── chatHistory.ts
+            └── utils.ts
 ```
 
 ---

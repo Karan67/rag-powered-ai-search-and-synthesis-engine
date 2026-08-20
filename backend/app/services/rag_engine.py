@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -15,17 +16,40 @@ logger = logging.getLogger("rag_engine.orchestrator")
 # query are rarely the chunks that actually cover the full list. Widen the net
 # for these instead of leaving the LLM to judge 5 thin chunks as "not enough".
 #
-# Note: this many chunks plus MAX_ANSWER_TOKENS can occasionally exceed
-# Groq's free-tier 8,000 TPM cap on a single heavy request (HTTP 413) — that's
-# handled gracefully below via _friendly_groq_error rather than avoided by
-# shrinking retrieval, since a narrower net would just make broad answers
-# worse across the board to avoid an occasional, clearly-explained failure.
+# Note: 40 full-size chunks cost roughly 6,200 tokens of context, so on Groq's
+# free-tier 8,000 TPM cap the reply budget is what has to give — see
+# _answer_tokens_for_query. Retrieval width stays as-is deliberately: a narrower
+# net would make every broad answer worse. Anything that still exceeds the cap
+# is reported through _friendly_groq_error rather than as raw JSON.
 _BROAD_QUERY_PATTERN = re.compile(
     r"\b(all|every|entire|complete|list|summarize|summary|overview)\b",
     re.IGNORECASE,
 )
 _BROAD_QUERY_TOP_K = 40
 _BROAD_QUERY_SIMILARITY_THRESHOLD = 0.1
+
+# "Who is X" has the opposite failure mode to a narrow factual lookup: no single
+# passage defines a character or concept, so the top 5 nearest chunks are just
+# the 5 places the name happens to appear. A characterisation has to be built
+# from many mentions, so widen — but only moderately, well short of the broad
+# tier, to stay inside the free-tier token budget.
+_ENTITY_QUERY_PATTERN = re.compile(
+    r"\b(?:who|what)\s+(?:is|are|was|were)\b|\btell me about\b|\bdescribe\b",
+    re.IGNORECASE,
+)
+_ENTITY_QUERY_TOP_K = 16
+_ENTITY_QUERY_SIMILARITY_THRESHOLD = 0.25
+
+# Fetch extra candidates so short, low-information fragments can be dropped
+# without starving the answer of context.
+_OVERFETCH_FACTOR = 4
+
+
+_TRUNCATION_NOTE = (
+    "\n\n*(Answer cut short — a question this broad pulls in a lot of context, "
+    "which leaves limited room for the reply. Ask about fewer items at a time "
+    "for a complete answer.)*"
+)
 
 
 def _friendly_groq_error(e: Exception) -> str:
@@ -40,9 +64,30 @@ def _friendly_groq_error(e: Exception) -> str:
     return "I'm sorry, something went wrong generating a response. Please try asking again."
 
 
-def _widen_for_broad_query(query: str, top_k: int, similarity_threshold: float) -> tuple[int, float]:
+def _answer_tokens_for_query(query: str) -> int:
+    """
+    Reply budget to request for this question.
+
+    Groq charges prompt + max_completion_tokens against the per-minute cap in
+    full, even when the answer comes back a fraction of that size. The widened
+    tiers already spend most of the free-tier budget on context, so asking for a
+    4,096-token reply on top of 40 passages is rejected outright with a 413
+    before the model produces anything. Narrow questions retrieve little and keep
+    the full budget.
+    """
+    if _BROAD_QUERY_PATTERN.search(query):
+        return settings.BROAD_ANSWER_TOKENS
+    if _ENTITY_QUERY_PATTERN.search(query):
+        return settings.ENTITY_ANSWER_TOKENS
+    return settings.MAX_ANSWER_TOKENS
+
+
+def _widen_for_query(query: str, top_k: int, similarity_threshold: float) -> tuple[int, float]:
+    """Pick a retrieval width based on the shape of the question."""
     if _BROAD_QUERY_PATTERN.search(query):
         return max(top_k, _BROAD_QUERY_TOP_K), min(similarity_threshold, _BROAD_QUERY_SIMILARITY_THRESHOLD)
+    if _ENTITY_QUERY_PATTERN.search(query):
+        return max(top_k, _ENTITY_QUERY_TOP_K), min(similarity_threshold, _ENTITY_QUERY_SIMILARITY_THRESHOLD)
     return top_k, similarity_threshold
 
 def format_rag_context(chunks: list[dict[str, Any]]) -> tuple[str, list[Citation]]:
@@ -76,11 +121,19 @@ def format_rag_context(chunks: list[dict[str, Any]]) -> tuple[str, list[Citation
 SYSTEM_PROMPT = """You are an Enterprise RAG Assistant specializing in document synthesis and analysis.
 Your primary objective is to accurately answer the user's question using ONLY the provided context passages below.
 
+ANSWERING STANCE — write about the subject, not about the passages:
+- The passages are your evidence, not your topic. Never describe what the passages themselves do. Phrases like "X is a character who speaks in the passages", "the document mentions X", or "according to the text provided" are wrong — state what is true about X.
+- Never quote a stray line of dialogue or a sentence fragment as if it were a definition.
+- For "who is X" or "what is X", build a characterisation by synthesising across ALL the passages: what role X holds, who X relates to, what X consistently does, and what X is like. Draw the picture from the combined evidence rather than reporting one fragment of it.
+- If the passages only show the subject in passing, say what can reasonably be concluded and note that the documents cover it only incidentally — that is far more useful than describing the fragments you were given.
+
 RESPONSE LENGTH & FORMAT — match the shape of your answer to the shape of the question:
 - A specific factual question ("which page does X first appear on?") gets a short, direct answer — one or two sentences, no preamble, no restating the question.
 - A question asking for a list, enumeration, or "all/every X" gets a structured bullet or numbered list of everything the context actually supports.
 - A question asking to summarize or explain gets a fuller structured answer with headings or bullets where that actually helps readability.
 - Never pad a simple answer to sound more thorough than it needs to be.
+- Prefer compact bullet lists to wide markdown tables. A table spends much of a limited reply budget on formatting scaffolding instead of content, and a long one gets cut off part-way through. Put the item name in bold, then its detail after a dash.
+- For a long enumeration, cover every item briefly rather than a few items richly — a complete short list beats a detailed list that stops halfway.
 
 STRICT CITATION RULES:
 1. Every claim, fact, or metric you extract MUST be accompanied by an inline citation tag like [1], [2], etc., corresponding to the context passage index.
@@ -101,16 +154,28 @@ async def retrieve_context(
     """
     Embed query and search vector store for matching passages.
     """
-    top_k, similarity_threshold = _widen_for_broad_query(query, top_k, similarity_threshold)
-    query_vector = embed_query(query)
-    chunks = await vector_search(
+    top_k, similarity_threshold = _widen_for_query(query, top_k, similarity_threshold)
+    # Embedding is CPU-bound ONNX work. Called directly it would block the event
+    # loop for its whole duration, stalling every other request (including health
+    # checks) — the same failure the ingest path already avoids via to_thread.
+    query_vector = await asyncio.to_thread(embed_query, query)
+    candidates = await vector_search(
         query_embedding=query_vector,
-        top_k=top_k,
+        top_k=top_k * _OVERFETCH_FACTOR,
         similarity_threshold=similarity_threshold,
         document_ids=document_ids
     )
-    if not chunks:
+    if not candidates:
         return "", []
+
+    # Drop fragments too short to answer from. Documents indexed before the
+    # chunker fix are full of these, and they outrank real passages on short
+    # queries because a tiny chunk containing a name is almost purely "about"
+    # that name. Fall back to the raw ranking when a document is legitimately
+    # short and every chunk is below the bar.
+    substantive = [c for c in candidates if len(c["content"]) >= settings.MIN_CONTEXT_CHARS]
+    chunks = (substantive or candidates)[:top_k]
+
     return format_rag_context(chunks)
 
 async def execute_rag_query(
@@ -143,11 +208,13 @@ async def execute_rag_query(
                 {"role": "user", "content": query}
             ],
             temperature=0.2,
-            max_completion_tokens=settings.MAX_ANSWER_TOKENS,
+            max_completion_tokens=_answer_tokens_for_query(query),
             reasoning_effort="low",
             include_reasoning=False,
         )
         answer = completion.choices[0].message.content or ""
+        if completion.choices[0].finish_reason == "length":
+            answer += _TRUNCATION_NOTE
     except Exception as e:
         logger.error(f"Groq API call error: {e}")
         answer = _friendly_groq_error(e)
@@ -212,17 +279,27 @@ async def stream_rag_query(
                 {"role": "user", "content": query}
             ],
             temperature=0.2,
-            max_completion_tokens=settings.MAX_ANSWER_TOKENS,
+            max_completion_tokens=_answer_tokens_for_query(query),
             reasoning_effort="low",
             include_reasoning=False,
             stream=True
         )
         
+        finish_reason: Optional[str] = None
         async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
-                yield f"data: {json.dumps({'event': 'token', 'token': token})}\n\n"
-                
+            if chunk.choices:
+                if chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    yield f"data: {json.dumps({'event': 'token', 'token': token})}\n\n"
+                if chunk.choices[0].finish_reason:
+                    finish_reason = chunk.choices[0].finish_reason
+
+        # Wide retrieval leaves only a small reply budget, so a long enumeration
+        # can stop mid-sentence. Say so rather than letting it look like the
+        # model simply had nothing more to add.
+        if finish_reason == "length":
+            yield f"data: {json.dumps({'event': 'token', 'token': _TRUNCATION_NOTE})}\n\n"
+
     except Exception as e:
         logger.error(f"Streaming error from Groq SDK: {e}")
         err_msg = _friendly_groq_error(e)
