@@ -1,15 +1,17 @@
 "use client";
 
 import React from "react";
-import { PanelLeftClose, Plus, Search } from "lucide-react";
+import { Github, PanelLeftClose, Plus, Search } from "lucide-react";
 import { ChatSession } from "@/lib/chatHistory";
-import { DocumentMeta } from "@/lib/api";
+import { DocumentMeta, IngestJob } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ChatList } from "./ChatList";
 import { DocumentPanel, UploadStatus } from "./DocumentPanel";
 import { ThemeToggle } from "./ThemeToggle";
 
 export type SidebarTab = "chats" | "files";
+
+const REPO_URL = "https://github.com/Karan67/rag-powered-ai-search-and-synthesis-engine";
 
 interface SidebarProps {
   open: boolean;
@@ -28,6 +30,8 @@ interface SidebarProps {
   selectedDocIds: string[];
   isUploading: boolean;
   uploadStatus: UploadStatus | null;
+  jobs: IngestJob[];
+  onDismissJob: (id: string) => void;
   onUpload: (file: File) => void;
   onDeleteDocument: (id: string) => void;
   onSelectDocIdsChange: (ids: string[]) => void;
@@ -48,6 +52,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   selectedDocIds,
   isUploading,
   uploadStatus,
+  jobs,
+  onDismissJob,
   onUpload,
   onDeleteDocument,
   onSelectDocIdsChange,
@@ -163,6 +169,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   selectedDocIds={selectedDocIds}
                   isUploading={isUploading}
                   uploadStatus={uploadStatus}
+                  jobs={jobs}
+                  onDismissJob={onDismissJob}
                   onUpload={onUpload}
                   onDelete={onDeleteDocument}
                   onSelectDocIdsChange={onSelectDocIdsChange}
@@ -174,6 +182,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {/* Footer */}
           <div className="border-t border-gray-200 px-3 py-2 dark:border-gray-850">
             <ThemeToggle />
+            <a
+              href={REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="View the source on GitHub"
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-850 dark:hover:text-gray-100"
+            >
+              <Github className="h-4 w-4 shrink-0" />
+              <span>Source on GitHub</span>
+            </a>
             <p className="px-2.5 pb-1 pt-1 text-[10px] leading-relaxed text-gray-500">
               gpt-oss-120b on Groq
               <br />

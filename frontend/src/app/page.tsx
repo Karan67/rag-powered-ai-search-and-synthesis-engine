@@ -8,9 +8,13 @@ import { Sidebar, SidebarTab } from "@/components/Sidebar";
 import {
   Citation,
   DocumentMeta,
+  IngestJob,
+  JOB_IS_ACTIVE,
   Message,
   deleteDocument,
+  fetchActiveJobs,
   fetchDocuments,
+  fetchJob,
   uploadDocument,
 } from "@/lib/api";
 import {
@@ -35,6 +39,7 @@ export default function Home() {
 
   const [isUploading, setIsUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<UploadStatus | null>(null);
+  const [jobs, setJobs] = useState<IngestJob[]>([]);
   const statusTimer = useRef<ReturnType<typeof setTimeout>>();
 
   // Restore chats from localStorage on first mount (client only).
@@ -66,6 +71,49 @@ export default function Home() {
     const interval = setInterval(loadDocuments, 10000);
     return () => clearInterval(interval);
   }, [loadDocuments]);
+
+  // Ingestion runs server-side, so a reload mid-upload should pick the job back
+  // up rather than leaving the user with no idea whether it is still running.
+  useEffect(() => {
+    fetchActiveJobs()
+      .then(setJobs)
+      .catch(() => {
+        /* backend may still be starting; the poll below recovers */
+      });
+  }, []);
+
+  // Keyed on the active ids rather than the jobs array, so progress updates do
+  // not tear down and recreate the interval on every tick.
+  const activeJobIds = jobs.filter(JOB_IS_ACTIVE).map((j) => j.id).sort().join(",");
+
+  useEffect(() => {
+    if (!activeJobIds) return;
+    const ids = activeJobIds.split(",");
+
+    const poll = async () => {
+      const results = await Promise.all(ids.map((id) => fetchJob(id).catch(() => null)));
+      const fresh = results.filter((j): j is IngestJob => j !== null);
+      if (fresh.length === 0) return;
+
+      setJobs((prev) => prev.map((j) => fresh.find((f) => f.id === j.id) ?? j));
+      // A finished job means the document list changed.
+      if (fresh.some((f) => !JOB_IS_ACTIVE(f))) loadDocuments();
+    };
+
+    const interval = setInterval(poll, 1500);
+    return () => clearInterval(interval);
+  }, [activeJobIds, loadDocuments]);
+
+  // Clear finished jobs shortly after they land; failures stay until dismissed
+  // so the reason does not disappear before it can be read.
+  useEffect(() => {
+    if (!jobs.some((j) => j.status === "completed")) return;
+    const timer = setTimeout(
+      () => setJobs((prev) => prev.filter((j) => j.status !== "completed")),
+      2500
+    );
+    return () => clearTimeout(timer);
+  }, [jobs]);
 
   useEffect(() => () => clearTimeout(statusTimer.current), []);
 
@@ -126,8 +174,8 @@ export default function Home() {
 
     try {
       const res = await uploadDocument(file);
-      showStatus({ type: "success", msg: res.message });
-      loadDocuments();
+      // Indexing continues in the background; the job carries progress from here.
+      setJobs((prev) => [res.job, ...prev.filter((j) => j.id !== res.job.id)]);
     } catch (err) {
       showStatus({
         type: "error",
@@ -177,6 +225,8 @@ export default function Home() {
         selectedDocIds={selectedDocIds}
         isUploading={isUploading}
         uploadStatus={uploadStatus}
+        jobs={jobs}
+        onDismissJob={(id) => setJobs((prev) => prev.filter((j) => j.id !== id))}
         onUpload={handleUpload}
         onDeleteDocument={handleDeleteDocument}
         onSelectDocIdsChange={setSelectedDocIds}

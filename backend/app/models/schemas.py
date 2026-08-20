@@ -48,3 +48,31 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     embedding_model: str
+
+
+class IngestJob(BaseModel):
+    """Progress of a background ingest, as polled by the client."""
+
+    id: str
+    document_id: Optional[str] = None
+    filename: str
+    file_size: int
+    # queued | parsing | embedding | completed | failed
+    status: str
+    chunks_total: int = 0
+    chunks_done: int = 0
+    error: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UploadAcceptedResponse(BaseModel):
+    """
+    Returned immediately from an upload, before ingestion has run.
+
+    Ingestion takes minutes for a large document, so the request cannot wait for
+    it. The client polls the job for progress.
+    """
+
+    message: str
+    job: IngestJob

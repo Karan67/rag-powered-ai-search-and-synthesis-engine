@@ -50,7 +50,31 @@ export interface QueryRequestOptions {
   document_ids?: string[];
 }
 
-export async function uploadDocument(file: File): Promise<{ message: string; document: DocumentMeta }> {
+export interface IngestJob {
+  id: string;
+  document_id: string | null;
+  filename: string;
+  file_size: number;
+  /** queued | parsing | embedding | completed | failed */
+  status: "queued" | "parsing" | "embedding" | "completed" | "failed";
+  chunks_total: number;
+  chunks_done: number;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export const JOB_IS_ACTIVE = (job: IngestJob) =>
+  job.status === "queued" || job.status === "parsing" || job.status === "embedding";
+
+/**
+ * Hand a file to the server and get back a job to follow.
+ *
+ * Indexing a large document takes minutes, so the request returns as soon as
+ * the work is queued rather than waiting for it — a request held open that long
+ * is lost to any dropped connection.
+ */
+export async function uploadDocument(file: File): Promise<{ message: string; job: IngestJob }> {
   const formData = new FormData();
   formData.append("file", file);
 
@@ -64,6 +88,23 @@ export async function uploadDocument(file: File): Promise<{ message: string; doc
     throw new Error(errData.detail || "Failed to upload document");
   }
 
+  return res.json();
+}
+
+export async function fetchJob(jobId: string): Promise<IngestJob> {
+  const res = await apiFetch(`${API_BASE_URL}/api/jobs/${jobId}`);
+  if (!res.ok) {
+    throw new Error("Could not read indexing progress");
+  }
+  return res.json();
+}
+
+/** Jobs still running, so a reloaded page picks up work already in flight. */
+export async function fetchActiveJobs(): Promise<IngestJob[]> {
+  const res = await apiFetch(`${API_BASE_URL}/api/jobs`);
+  if (!res.ok) {
+    throw new Error("Could not list indexing jobs");
+  }
   return res.json();
 }
 

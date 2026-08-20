@@ -1,18 +1,16 @@
-import asyncio
 import logging
-import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.models.schemas import (
-    FileUploadResponse, DocumentMeta, QueryRequest, QueryResponse, HealthResponse
+    DocumentMeta, QueryRequest, QueryResponse, HealthResponse,
+    IngestJob, UploadAcceptedResponse
 )
 from app.services import db
-from app.services import parser
+from app.services import ingest
 from app.services import vector_store
 from app.services import rag_engine
 
@@ -31,16 +29,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Database initialization deferred or failed: {e}")
         
-    # Pre-warm FastEmbed model
+    # Warm the embedding backend so the first upload does not pay model load
+    # time, and a misconfigured backend fails on boot rather than mid-ingest.
     try:
         vector_store.get_embedding_model()
-        logger.info("FastEmbed model loaded successfully.")
+        logger.info("Embedding backend ready.")
     except Exception as e:
-        logger.warning(f"FastEmbed model pre-warming warning: {e}")
-        
+        logger.warning(f"Embedding backend warm-up warning: {e}")
+
+    # Anything still marked running belongs to a process that no longer exists;
+    # its queue died with it, so it can never resume.
+    try:
+        await db.fail_interrupted_jobs()
+    except Exception as e:
+        logger.warning(f"Could not reconcile interrupted jobs: {e}")
+
+    await ingest.start_worker()
+
     yield
-    
+
     logger.info("Shutting down RAG Engine service...")
+    await ingest.stop_worker()
     await db.close_pool()
 
 app = FastAPI(
@@ -71,11 +80,23 @@ async def health_check():
         embedding_model=settings.EMBEDDING_MODEL
     )
 
-@app.post("/api/upload", response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/api/upload",
+    response_model=UploadAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def upload_document(file: UploadFile = File(...)):
+    """
+    Accept a document and queue it for ingestion.
+
+    Returns 202 with a job id rather than waiting for the work. Embedding a
+    book-sized PDF takes minutes, and a request held open that long is lost to
+    any dropped connection or proxy timeout, with no way to resume it. Poll
+    /api/jobs/{job_id} for progress.
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
-        
+
     content_bytes = await file.read()
     file_size = len(content_bytes)
 
@@ -94,94 +115,53 @@ async def upload_document(file: UploadFile = File(...)):
             ),
         )
 
-    try:
-        # 1. Save Document record
-        doc_id = await db.create_document(
+    job_id = await db.create_job(filename=file.filename, file_size=file_size)
+
+    accepted = await ingest.enqueue(
+        ingest.IngestTask(
+            job_id=job_id,
             filename=file.filename,
             content_type=file.content_type or "application/octet-stream",
-            file_size=file_size
-        )
-        
-        # 2. Parse text page-by-page (CPU-bound — run off the event loop so a
-        # large file doesn't freeze every other request, including health checks)
-        parse_start = time.monotonic()
-        pages = await asyncio.to_thread(
-            parser.parse_document,
             file_bytes=content_bytes,
-            filename=file.filename,
-            content_type=file.content_type or ""
         )
-        parse_seconds = time.monotonic() - parse_start
-
-        if not pages:
-            raise HTTPException(status_code=400, detail="Could not extract text content from document.")
-
-        # 3. Chunk text using sliding window
-        chunks = parser.chunk_text_sliding_window(pages)
-
-        if not chunks:
-            raise HTTPException(status_code=400, detail="Document contained no parseable text chunks.")
-
-        logger.info(
-            f"Parsed '{file.filename}': {len(pages)} pages -> {len(chunks)} chunks "
-            f"in {parse_seconds:.1f}s"
+    )
+    if not accepted:
+        # Queued files sit in memory, so the depth is capped. Refusing clearly
+        # beats accepting the work and then being killed for it.
+        await db.update_job(
+            job_id,
+            status="failed",
+            error="Server is busy ingesting other documents. Please try again shortly.",
         )
-        embed_start = time.monotonic()
-
-        # 4-5. Generate embeddings and insert in bounded batches instead of all
-        # at once. Holding every embedding for a whole document in memory before
-        # writing anything makes peak memory scale with document size — this is
-        # what pushed a 3.5GB container toward its limit on a single 1MB PDF.
-        # Batching keeps peak memory flat regardless of file size, and updates
-        # chunk_count as it goes so progress is visible in the UI in real time
-        # instead of jumping from 0 straight to done.
-        batch_size = settings.EMBED_BATCH_SIZE
-        inserted = 0
-        for batch_start in range(0, len(chunks), batch_size):
-            batch = chunks[batch_start:batch_start + batch_size]
-            contents = [c["content"] for c in batch]
-            embeddings = await asyncio.to_thread(vector_store.embed_texts, contents)
-
-            chunks_data = [
-                {
-                    "chunk_index": c["chunk_index"],
-                    "content": c["content"],
-                    "embedding": emb,
-                    "metadata": c["metadata"],
-                }
-                for c, emb in zip(batch, embeddings)
-            ]
-            await db.insert_chunks(doc_id, chunks_data)
-
-            inserted += len(batch)
-            await db.update_document_chunk_count(doc_id, inserted)
-            logger.info(
-                f"Progress: {inserted}/{len(chunks)} chunks embedded+inserted "
-                f"for '{file.filename}' ({time.monotonic() - embed_start:.1f}s elapsed)"
-            )
-        
-        doc_meta = DocumentMeta(
-            id=doc_id,
-            filename=file.filename,
-            content_type=file.content_type or "application/octet-stream",
-            file_size=file_size,
-            chunk_count=len(chunks),
-            created_at=datetime.now(timezone.utc)
-        )
-        
-        return FileUploadResponse(
-            message=f"Document '{file.filename}' processed and indexed successfully into {len(chunks)} chunks.",
-            document=doc_meta
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error ingesting document {file.filename}: {e}", exc_info=True)
         raise HTTPException(
-            status_code=500,
-            detail=f"An error occurred while processing document: {str(e)}"
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Server is busy ingesting other documents. "
+                "Please try again in a few minutes."
+            ),
         )
+
+    job = await db.get_job(job_id)
+    return UploadAcceptedResponse(
+        message=f"'{file.filename}' queued for indexing.",
+        job=IngestJob(**job),
+    )
+
+
+@app.get("/api/jobs/{job_id}", response_model=IngestJob)
+async def get_ingest_job(job_id: str):
+    """Progress of a single ingest job."""
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No such ingest job.")
+    return IngestJob(**job)
+
+
+@app.get("/api/jobs", response_model=list[IngestJob])
+async def list_ingest_jobs():
+    """Jobs still queued or running, so a reloaded page can pick them back up."""
+    return [IngestJob(**j) for j in await db.list_active_jobs()]
+
 
 @app.get("/api/documents", response_model=list[DocumentMeta])
 async def get_documents():
